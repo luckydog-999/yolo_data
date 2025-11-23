@@ -4,7 +4,7 @@ import os
 OUTPUT_FILE = "project_structure.txt"
 
 # 🚫 忽略的文件夹
-IGNORE_DIRS = {'.vscode', '.git', '__pycache__', '.idea', 'venv', 'node_modules'}
+IGNORE_DIRS = {'.vscode', '.git', '__pycache__', '.idea', 'venv', 'node_modules', 'labels'}
 
 # 🚫 忽略的文件后缀
 IGNORE_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.pyc', '.exe', '.dll'}

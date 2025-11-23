@@ -9,8 +9,10 @@ Project Structure: yolo_prepare
     🐍 tree.py
     📂 blender_output/
         🐍 code_in_blender.py
+        🐍 mask_to_label.py
         📝 readme.txt
         🐍 test_speed.py
+        📂 labels/
         📂 masks/
         📂 raws/
     📂 images/
