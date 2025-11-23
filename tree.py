@@ -106,6 +106,6 @@ if __name__ == "__main__":
             generate_tree(root_dir, f)
             
         print(f"\n✅ 成功！文件已保存为: {OUTPUT_FILE}")
-        print(f"   (你可以直接在 VS Code 中打开它)")
+
     except Exception as e:
         print(f"\n❌ 发生错误: {e}")
