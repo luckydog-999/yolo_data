@@ -1,0 +1,12 @@
+# 忽略 Blender 生成的数据集文件夹
+raws/
+masks/
+
+# 忽略最终处理好的 YOLO 数据集（如果不想上传）
+images/
+labels/
+datasets/
+
+# 忽略 Python 缓存文件
+__pycache__/
+*.pyc
