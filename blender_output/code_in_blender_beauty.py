@@ -27,8 +27,8 @@ BATCH_SIZE = 100
 OBJ_NAME = "insert"
 OBJ_INDEX = 1
 
-CAM_DIST_MIN = 0.3
-CAM_DIST_MAX = 1.2
+CAM_DIST_MIN = 0.2
+CAM_DIST_MAX = 0.8
 
 # ZED 内参
 FX = 520.947
@@ -196,7 +196,7 @@ def main():
     start_idx = get_next_start_index(path_raw, "image_")
     end_idx = start_idx + BATCH_SIZE
     
-    print(f"📂 输出目录: {path_raw}")
+    print(f"📂 输出目录: {OUTPUT_ROOT}")
     print(f"🔢 任务范围: {start_idx} --> {end_idx - 1}")
     print(f"🎯 开始渲染 {BATCH_SIZE} 张图片...\n")
     
