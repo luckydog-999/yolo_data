@@ -1,0 +1,17 @@
+Project Structure: yolo_prepare
+==============================
+📂 yolo_prepare/
+    🙈 .gitignore
+    🐍 prepare_yolo_train_json.py
+    🐍 prepare_yolo_train_txt.py
+    📝 project_structure.txt
+    🐍 train.py
+    🐍 tree.py
+    📂 blender_output/
+        🐍 code_in_blender.py
+        📝 readme.txt
+        🐍 test_speed.py
+        📂 masks/
+        📂 raws/
+    📂 images/
+    📂 labels/
