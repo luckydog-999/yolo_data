@@ -4,9 +4,7 @@ import shutil
 import random
 import os
 import argparse
-from collections import Counter
 import yaml
-import json
 import cv2
 import albumentations as A
 import numpy as np
@@ -23,7 +21,7 @@ transform = A.Compose([
     A.GaussianBlur(p=0.2),
 ])
 
-# 增强倍数
+# 增强倍数 (每张原图生成多少张增强图)
 AUGMENTATIONS_PER_IMAGE = 3
 # =================================================================================
 
@@ -32,24 +30,146 @@ def mkdir(path):
     if not os.path.exists(path):
         os.makedirs(path)
 
-def get_classes(json_dir):
-    names = []
-    # 注意：这里只统计原始JSON中的类别
-    json_files = [os.path.join(json_dir, f) for f in os.listdir(json_dir) if f.endswith('.json')]
-    for json_path in json_files:
-        with open(json_path, 'r') as f:
-            data = json.load(f)
-            for shape in data['shapes']:
-                name = shape['label']
-                names.append(name)
-    result = Counter(names)
-    return result
-
-
-def split_dataset(all_images_dir, all_labels_dir, json_dir_for_yaml):
+def yolo_txt_to_mask(txt_path, height, width):
     """
-    修改后的划分函数：
-    将数据直接划分为根目录下的 ./images/train, ./images/val 和 ./labels/train, ./labels/val
+    将 YOLO 格式的 TXT 标签转换为掩码图像，以便进行数据增强。
+    """
+    mask = np.zeros((height, width), dtype=np.uint8)
+    
+    if not os.path.exists(txt_path):
+        return mask
+
+    with open(txt_path, 'r') as f:
+        lines = f.readlines()
+
+    for line in lines:
+        parts = line.strip().split()
+        if not parts:
+            continue
+        
+        # class_id
+        class_id = int(parts[0])
+        
+        # 坐标点 (归一化 -> 像素坐标)
+        coords = [float(x) for x in parts[1:]]
+        points = []
+        for i in range(0, len(coords), 2):
+            x = int(coords[i] * width)
+            y = int(coords[i+1] * height)
+            points.append([x, y])
+        
+        if len(points) > 0:
+            pts = np.array(points, np.int32)
+            pts = pts.reshape((-1, 1, 2))
+            # 在掩码上绘制填充多边形
+            # 颜色值 = class_id + 1 (为了区分背景0)
+            cv2.fillPoly(mask, [pts], color=(class_id + 1))
+            
+    return mask
+
+def mask_to_yolo_txt(mask, w, h, save_path):
+    """
+    将增强后的掩码转换回 YOLO TXT 格式。
+    """
+    yolo_lines = []
+    unique_ids = np.unique(mask)
+
+    for seg_val in unique_ids:
+        if seg_val == 0: 
+            continue
+        
+        # 还原真实的 class_id
+        class_id = seg_val - 1 
+        
+        # 提取该类别的二值掩码
+        binary_mask = np.where(mask == seg_val, 255, 0).astype(np.uint8)
+        # 查找轮廓
+        contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        for contour in contours:
+            # 过滤过小的轮廓
+            if contour.shape[0] > 3:
+                # 归一化坐标
+                normalized_contour = contour.astype(np.float32).reshape(-1, 2)
+                normalized_contour[:, 0] /= w
+                normalized_contour[:, 1] /= h
+                
+                # 限制坐标在0-1之间
+                np.clip(normalized_contour, 0, 1, out=normalized_contour)
+                
+                # 格式化坐标字符串
+                points_str = " ".join([f"{p[0]:.6f} {p[1]:.6f}" for p in normalized_contour])
+                yolo_lines.append(f"{class_id} {points_str}")
+
+    # 保存 TXT
+    with open(save_path, 'w') as f:
+        if yolo_lines:
+            f.write("\n".join(yolo_lines))
+        else:
+            # 如果增强后物体消失（例如移出了画面），生成空文件
+            pass 
+
+def augment_data(image_dir, label_dir, all_images_save_dir, all_labels_save_dir):
+    """
+    读取图片和TXT标签 -> 转掩码 -> 增强 -> 转回TXT -> 保存
+    """
+    mkdir(all_images_save_dir)
+    mkdir(all_labels_save_dir)
+
+    # 支持常见的图片格式
+    image_files = [f for f in os.listdir(image_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
+
+    for image_name in tqdm(image_files, desc="数据增强处理中"):
+        base_name = os.path.splitext(image_name)[0]
+        image_path = os.path.join(image_dir, image_name)
+        
+        # 寻找对应的 txt 文件
+        txt_name = base_name + '.txt'
+        txt_path = os.path.join(label_dir, txt_name)
+
+        if not os.path.exists(txt_path):
+            print(f"警告：找不到对应的标签文件 {txt_path}，跳过 {image_name}")
+            continue
+
+        # 1. 读取原始图像
+        image = cv2.imread(image_path)
+        if image is None:
+            continue
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        h, w = image.shape[:2]
+
+        # 2. 读取 TXT 并转换为掩码
+        mask = yolo_txt_to_mask(txt_path, h, w)
+
+        # 3. 保存原始数据 (复制图片和标签)
+        shutil.copyfile(image_path, os.path.join(all_images_save_dir, image_name))
+        shutil.copyfile(txt_path, os.path.join(all_labels_save_dir, txt_name))
+
+        # 4. 生成增强数据
+        for i in range(AUGMENTATIONS_PER_IMAGE):
+            # 应用增强
+            try:
+                augmented = transform(image=image, mask=mask)
+                aug_image = augmented['image']
+                aug_mask = augmented['mask']
+
+                # 定义新文件名
+                new_base_name = f"{base_name}_aug_{i}"
+                output_image_path = os.path.join(all_images_save_dir, new_base_name + ".png") # 统一保存为png防止压缩损失
+                output_label_path = os.path.join(all_labels_save_dir, new_base_name + ".txt")
+
+                # 保存图片 (转回 BGR)
+                cv2.imwrite(output_image_path, cv2.cvtColor(aug_image, cv2.COLOR_RGB2BGR))
+                
+                # 保存标签 (掩码 -> TXT)
+                mask_to_yolo_txt(aug_mask, w, h, output_label_path)
+            
+            except Exception as e:
+                print(f"增强 {image_name} 时出错: {e}")
+
+def split_dataset(all_images_dir, all_labels_dir, classes_str):
+    """
+    划分训练集和验证集，并生成 segment.yaml
     """
     # 定义根目录下的目标路径
     root_dir = '.'  # 当前根目录
@@ -61,18 +181,16 @@ def split_dataset(all_images_dir, all_labels_dir, json_dir_for_yaml):
     label_train_path = os.path.join(labels_dir, 'train')
     label_val_path = os.path.join(labels_dir, 'val')
 
-    # 创建目录结构
-    mkdir(images_dir)
-    mkdir(labels_dir)
-    mkdir(img_train_path)
-    mkdir(img_val_path)
-    mkdir(label_train_path)
-    mkdir(label_val_path)
+    # 创建目录
+    mkdir(images_dir); mkdir(labels_dir)
+    mkdir(img_train_path); mkdir(img_val_path)
+    mkdir(label_train_path); mkdir(label_val_path)
 
+    # 划分比例
     train_percent = 0.90
     
-    # 获取所有增强后生成的txt标签文件列表
-    total_txt = os.listdir(all_labels_dir)
+    # 获取所有标签文件
+    total_txt = [f for f in os.listdir(all_labels_dir) if f.endswith('.txt')]
     num_txt = len(total_txt)
     list_all_txt = range(num_txt)
 
@@ -80,168 +198,92 @@ def split_dataset(all_images_dir, all_labels_dir, json_dir_for_yaml):
     train = random.sample(list_all_txt, num_train)
     val = [i for i in list_all_txt if not i in train]
 
-    print(f"目标路径: ./images 和 ./labels")
-    print(f"划分数据集: 训练集数目：{len(train)}, 验证集数目：{len(val)}")
+    print(f"数据集划分: 训练集 {len(train)} 张, 验证集 {len(val)} 张")
 
-    for i in tqdm(list_all_txt, desc="划分并移动文件"):
-        name = total_txt[i][:-4]
-        srcImage = os.path.join(all_images_dir, name + '.png')
-        srcLabel = os.path.join(all_labels_dir, name + '.txt')
+    for i in tqdm(list_all_txt, desc="分配文件到 dataset 目录"):
+        txt_filename = total_txt[i]
+        base_name = os.path.splitext(txt_filename)[0]
+        
+        # 寻找对应的图片 (可能是 .png 或 .jpg)
+        srcLabel = os.path.join(all_labels_dir, txt_filename)
+        
+        # 尝试寻找对应的图片文件
+        srcImage = None
+        for ext in ['.png', '.jpg', '.jpeg', '.bmp']:
+            temp_path = os.path.join(all_images_dir, base_name + ext)
+            if os.path.exists(temp_path):
+                srcImage = temp_path
+                break
+        
+        if srcImage is None:
+            # print(f"警告: 找不到标签 {txt_filename} 对应的图片")
+            continue
+
+        img_filename = os.path.basename(srcImage)
 
         if i in train:
-            dst_train_Image = os.path.join(img_train_path, name + '.png')
-            dst_train_Label = os.path.join(label_train_path, name + '.txt')
-            shutil.copyfile(srcImage, dst_train_Image)
-            shutil.copyfile(srcLabel, dst_train_Label)
-        elif i in val:
-            dst_val_Image = os.path.join(img_val_path, name + '.png')
-            dst_val_Label = os.path.join(label_val_path, name + '.txt')
-            shutil.copyfile(srcImage, dst_val_Image)
-            shutil.copyfile(srcLabel, dst_val_Label)
+            shutil.copyfile(srcImage, os.path.join(img_train_path, img_filename))
+            shutil.copyfile(srcLabel, os.path.join(label_train_path, txt_filename))
+        else:
+            shutil.copyfile(srcImage, os.path.join(img_val_path, img_filename))
+            shutil.copyfile(srcLabel, os.path.join(label_val_path, txt_filename))
 
-    # 生成 yaml 文件
-    obj_classes = get_classes(json_dir_for_yaml)
-    classes = list(obj_classes.keys())
-    classes_txt = {i: classes[i] for i in range(len(classes))}
+    # 生成 segment.yaml
+    classes_list = classes_str.split(',')
+    # 构造 names 字典: {0: 'cat', 1: 'dog'}
+    names_dict = {i: name for i, name in enumerate(classes_list)}
     
     data = {
-        'path': os.path.abspath(root_dir), # 使用绝对路径避免错误
+        'path': os.path.abspath(root_dir),
         'train': "images/train",
         'val': "images/val",
-        'names': classes_txt,
-        'nc': len(classes)
+        'names': names_dict,
+        'nc': len(classes_list)
     }
     
     yaml_path = os.path.join(root_dir, 'segment.yaml')
     with open(yaml_path, 'w', encoding="utf-8") as file:
         yaml.dump(data, file, allow_unicode=True)
         
-    print("标签统计：", dict(obj_classes))
-    print(f"配置文件已生成：{yaml_path}")
-
-
-# =================================================================================
-# 2. 核心数据增强函数 (保持不变，负责生成中间数据)
-# =================================================================================
-def augment_data(image_dir, json_dir, all_images_save_dir, all_labels_save_dir, classes_str):
-    classes = classes_str.split(',')
-    class_to_id = {name: i for i, name in enumerate(classes)}
-
-    mkdir(all_images_save_dir)
-    mkdir(all_labels_save_dir)
-
-    image_files = [f for f in os.listdir(image_dir) if f.lower().endswith('.png') or f.lower().endswith('.jpg')]
-
-    for image_name in tqdm(image_files, desc="增强并转换数据中"):
-        base_name = os.path.splitext(image_name)[0]
-        image_path = os.path.join(image_dir, image_name)
-        json_path = os.path.join(json_dir, base_name + '.json')
-
-        if not os.path.exists(json_path):
-            print(f"警告：找不到对应的JSON文件 {json_path}，跳过 {image_name}")
-            continue
-
-        # 读取原始图像和JSON
-        image = cv2.imread(image_path)
-        if image is None:
-            continue
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
-        with open(json_path, 'r') as f:
-            data = json.load(f)
-
-        h, w = data['imageHeight'], data['imageWidth']
-        mask = np.zeros((h, w), dtype=np.uint8)
-
-        # 从JSON创建掩码
-        for shape in data['shapes']:
-            label = shape['label']
-            if label in class_to_id:
-                class_id = class_to_id[label]
-                points = np.array(shape['points'], dtype=np.int32)
-                # 类别ID+1，0作为背景
-                cv2.fillPoly(mask, [points], color=(class_id + 1))
-
-        # --- a. 处理并保存原始数据 ---
-        shutil.copyfile(image_path, os.path.join(all_images_save_dir, image_name))
-        yolo_txt_path = os.path.join(all_labels_save_dir, base_name + '.txt')
-        mask_to_yolo_txt(mask, w, h, class_to_id, yolo_txt_path)
-
-        # --- b. 进行数据增强 ---
-        for i in range(AUGMENTATIONS_PER_IMAGE):
-            augmented = transform(image=image, mask=mask)
-            aug_image = augmented['image']
-            aug_mask = augmented['mask']
-
-            new_base_name = f"{base_name}_aug_{i}"
-            output_image_path = os.path.join(all_images_save_dir, new_base_name + ".png")
-            output_label_path = os.path.join(all_labels_save_dir, new_base_name + ".txt")
-
-            cv2.imwrite(output_image_path, cv2.cvtColor(aug_image, cv2.COLOR_RGB2BGR))
-            mask_to_yolo_txt(aug_mask, w, h, class_to_id, output_label_path)
-
-
-def mask_to_yolo_txt(mask, w, h, class_to_id, save_path):
-    yolo_lines = []
-    unique_ids = np.unique(mask)
-
-    for seg_val in unique_ids:
-        if seg_val == 0: 
-            continue
-        
-        class_id = seg_val - 1 
-        
-        binary_mask = np.where(mask == seg_val, 255, 0).astype(np.uint8)
-        contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        for contour in contours:
-            if contour.shape[0] > 2:
-                normalized_contour = contour.astype(np.float32).reshape(-1, 2)
-                normalized_contour[:, 0] /= w
-                normalized_contour[:, 1] /= h
-                
-                # 限制坐标在0-1之间，防止增强导致越界
-                np.clip(normalized_contour, 0, 1, out=normalized_contour)
-                
-                points_str = " ".join([f"{p[0]:.6f} {p[1]:.6f}" for p in normalized_contour])
-                yolo_lines.append(f"{class_id} {points_str}")
-
-    with open(save_path, 'w') as f:
-        f.write("\n".join(yolo_lines))
+    print(f"配置文件生成完毕: {yaml_path}")
+    print(f"类别信息: {names_dict}")
 
 
 if __name__ == "__main__":
-    # 这里设置您的类别，如果不是 passive 请修改
-    classes_list = 'passive' 
+    # 默认类别名称
+    default_classes = 'passive' 
 
-    parser = argparse.ArgumentParser(description='YOLO Segmentation Dataset Preparation')
-    # 建议将原始素材放在 raw_data 或 origin 文件夹，避免和生成的 ./images 冲突
-    parser.add_argument('--image-dir', type=str, default='./raw_images', help='原始图片存放文件夹')
-    parser.add_argument('--json-dir', type=str, default='./raw_json', help='原始json存放文件夹')
-    parser.add_argument('--classes', type=str, default=classes_list, help='类别名称')
+    parser = argparse.ArgumentParser(description='YOLO TXT Dataset Augmentation and Split')
+    
+    # 输入参数：原始图片和原始txt标签所在的文件夹
+    parser.add_argument('--image-dir', type=str, default='./raw_images', help='存放原始图片的文件夹路径')
+    parser.add_argument('--label-dir', type=str, default='./raw_labels', help='存放原始TXT标签的文件夹路径')
+    parser.add_argument('--classes', type=str, default=default_classes, help='类别名称，用逗号分隔 (例如: cat,dog)')
+    
     args = parser.parse_args()
 
-    # 1. 设置中间临时目录 (生成完后可以删除)
+    # 临时文件夹
     ALL_IMAGES_DIR = './temp_all_images'
     ALL_LABELS_DIR = './temp_all_labels'
 
-    if not os.path.exists(args.image_dir) or not os.path.exists(args.json_dir):
-        print(f"错误：输入目录不存在。请确保原始图片在 {args.image_dir}，原始JSON在 {args.json_dir}")
-        print("或者通过命令行参数指定: python prepare.py --image-dir 你的图片目录 --json-dir 你的json目录")
+    # 检查输入目录
+    if not os.path.exists(args.image_dir) or not os.path.exists(args.label_dir):
+        print("❌ 错误：输入目录不存在！")
+        print(f"请检查 --image-dir ({args.image_dir}) 和 --label-dir ({args.label_dir})")
         exit()
 
-    # 2. 执行增强和转换 -> 存入临时目录
-    print("步骤 1/2: 数据增强与格式转换...")
-    augment_data(args.image_dir, args.json_dir, ALL_IMAGES_DIR, ALL_LABELS_DIR, args.classes)
-    print("增强完成！")
+    # 1. 增强
+    print("\n>>> 步骤 1/2: 数据增强...")
+    augment_data(args.image_dir, args.label_dir, ALL_IMAGES_DIR, ALL_LABELS_DIR)
+    print("✅ 增强完成")
 
-    # 3. 划分数据集 -> 存入根目录 ./images 和 ./labels
-    print("\n步骤 2/2: 划分数据集到根目录 ./images 和 ./labels ...")
-    split_dataset(ALL_IMAGES_DIR, ALL_LABELS_DIR, args.json_dir)
-    print("完成！")
+    # 2. 划分
+    print("\n>>> 步骤 2/2: 划分数据集...")
+    split_dataset(ALL_IMAGES_DIR, ALL_LABELS_DIR, args.classes)
+    print("✅ 划分完成")
     
-    # 4. 清理临时文件
-    print("清理临时文件...")
+    # 3. 清理
+    print("\n正在清理临时文件...")
     shutil.rmtree(ALL_IMAGES_DIR)
     shutil.rmtree(ALL_LABELS_DIR)
-    print("清理完毕。现在您可以直接使用 segment.yaml 开始训练。")
+    print("🎉 全部搞定！数据集已保存在 ./images 和 ./labels，配置文件为 segment.yaml")

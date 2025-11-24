@@ -1,6 +1,8 @@
 # 忽略 Blender 生成的数据集文件夹
 raws/
 masks/
+raw_images/
+raw_labels/
 
 # 忽略最终处理好的 YOLO 数据集（如果不想上传）
 images/
